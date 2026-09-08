@@ -75,62 +75,66 @@ export async function generateWeeklySummary(
     );
   }
 
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: userPrompt },
+  ];
+
+  const call = (url: string, key: string, model: string) =>
+    fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({ model, messages }),
+    });
+
   let res: Response;
   if (lovableKey) {
-    res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${lovableKey}`,
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3.7-flash",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
-  } else if (openAiKey) {
-    res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${openAiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
-  } else {
-    res = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${geminiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gemini-2.5-flash",
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      },
+    res = await call(
+      "https://ai.gateway.lovable.dev/v1/chat/completions",
+      lovableKey,
+      "google/gemini-2.5-flash",
     );
+  } else if (openAiKey) {
+    res = await call("https://api.openai.com/v1/chat/completions", openAiKey, "gpt-4o-mini");
+  } else {
+    const geminiUrl =
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+    // Model availability differs per key/region — try known-good names in order.
+    const candidates = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-latest"];
+    res = await call(geminiUrl, geminiKey!, candidates[0]!);
+    for (let i = 1; i < candidates.length && res.status === 404; i++) {
+      res = await call(geminiUrl, geminiKey!, candidates[i]!);
+    }
   }
 
-  if (res.status === 429) throw new Error("The summary service is busy right now. Please try again in a moment.");
-  if (res.status === 402) throw new Error("AI usage limit reached for this workspace.");
-  if (res.status === 401 || res.status === 403)
-    throw new Error("The summary service rejected this deployment's AI key. Check the server-side AI key setting.");
-  if (!res.ok) throw new Error(`Summary unavailable (${res.status}).`);
+  const provider = lovableKey ? "Lovable AI" : openAiKey ? "OpenAI" : "Gemini";
+
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    let detail = raw.slice(0, 300);
+    try {
+      const parsed = JSON.parse(raw) as { error?: { message?: string; code?: string } };
+      if (parsed.error?.message) detail = parsed.error.message;
+      if (parsed.error?.code === "insufficient_quota") {
+        throw new Error(
+          `${provider} rejected the request: your account has no remaining credit/quota. Add billing to the ${provider} account, then try again.`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith(provider)) throw e;
+    }
+
+    if (res.status === 429)
+      throw new Error(`${provider} is rate-limiting or out of quota (429): ${detail}`);
+    if (res.status === 402) throw new Error(`${provider} usage limit reached: ${detail}`);
+    if (res.status === 401 || res.status === 403)
+      throw new Error(`${provider} rejected this deployment's API key (${res.status}): ${detail}`);
+    throw new Error(`Summary unavailable — ${provider} returned ${res.status}: ${detail}`);
+  }
+
 
 
   const json = (await res.json()) as {
